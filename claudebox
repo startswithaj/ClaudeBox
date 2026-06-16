@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE_NAME="claudebox"
+CONTAINER_WORKDIR="/workspace"
+FORWARD_SSH=false
+DO_BUILD=false
+BUILD_WITH=""
+PORT_ARGS=()
+CLAUDE_ARGS=()
+
+# Available optional tools
+ALL_TOOLS="go,python,rust"
+
+# Parse claudebox-specific flags, collect the rest for claude
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --build)
+            DO_BUILD=true
+            shift
+            ;;
+        --with)
+            BUILD_WITH="$2"
+            shift 2
+            ;;
+        --ssh)
+            FORWARD_SSH=true
+            shift
+            ;;
+        -p|--port)
+            PORT_ARGS+=(-p "$2")
+            shift 2
+            ;;
+        *)
+            CLAUDE_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Build the image if requested
+if [[ "$DO_BUILD" == true ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    BUILD_ARGS=()
+
+    if [[ -n "$BUILD_WITH" ]]; then
+        # Disable all optional tools, then enable only the ones specified
+        for tool in ${ALL_TOOLS//,/ }; do
+            BUILD_ARGS+=(--build-arg "INSTALL_${tool^^}=false")
+        done
+        for tool in ${BUILD_WITH//,/ }; do
+            BUILD_ARGS+=(--build-arg "INSTALL_${tool^^}=true")
+        done
+    fi
+
+    echo "Building claudebox image..." >&2
+    docker build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    echo "Build complete." >&2
+fi
+
+if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    echo "claudebox image not found. Building..." >&2
+    docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    echo "Build complete." >&2
+fi
+
+# Generate a container name from the current directory
+CONTAINER_NAME="claudebox-$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+
+# Collect volumes to mount
+DOCKER_ARGS=(
+    --rm
+    --name "$CONTAINER_NAME"
+    -v "$(pwd):${CONTAINER_WORKDIR}"
+    -w "${CONTAINER_WORKDIR}"
+)
+
+# Forward port mappings
+if [[ ${#PORT_ARGS[@]} -gt 0 ]]; then
+    DOCKER_ARGS+=("${PORT_ARGS[@]}")
+fi
+
+# Forward SSH agent if requested and available
+if [[ "$FORWARD_SSH" == true ]]; then
+    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+        DOCKER_ARGS+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+    else
+        echo "Warning: --ssh passed but SSH_AUTH_SOCK is not set." >&2
+    fi
+fi
+
+# Forward the Anthropic API key if set
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY")
+fi
+
+# Forward Claude config directory so settings/memory persist
+CLAUDE_CONFIG_DIR="${HOME}/.claude"
+if [[ -d "$CLAUDE_CONFIG_DIR" ]]; then
+    DOCKER_ARGS+=(-v "${CLAUDE_CONFIG_DIR}:/root/.claude")
+fi
+
+# Forward Claude config file (.claude.json) if it exists
+CLAUDE_CONFIG_FILE="${HOME}/.claude.json"
+if [[ -f "$CLAUDE_CONFIG_FILE" ]]; then
+    DOCKER_ARGS+=(-v "${CLAUDE_CONFIG_FILE}:/root/.claude.json")
+fi
+
+# On macOS, Claude Code stores the OAuth token in the Keychain rather than in a
+# file, so the Linux container has no credentials and reports "not logged in".
+# Export the Keychain credential to a file the container reads (~/.claude/.credentials.json).
+if [[ "$(uname)" == "Darwin" ]]; then
+    SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+    CREDS_FILE="${SCRIPT_DIR}/.claudebox-credentials.json"
+    if security find-generic-password -s "Claude Code-credentials" -w >"$CREDS_FILE" 2>/dev/null \
+        && [[ -s "$CREDS_FILE" ]]; then
+        chmod 600 "$CREDS_FILE"
+        DOCKER_ARGS+=(-v "${CREDS_FILE}:/root/.claude/.credentials.json")
+    else
+        rm -f "$CREDS_FILE"
+        echo "Warning: could not read Claude credentials from the macOS Keychain." >&2
+    fi
+fi
+
+# Allocate a TTY if stdin is a terminal (interactive use)
+if [ -t 0 ]; then
+    DOCKER_ARGS+=(-it)
+fi
+
+exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
