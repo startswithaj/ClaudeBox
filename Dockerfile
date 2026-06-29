@@ -65,10 +65,13 @@ RUN if [ "$INSTALL_PYTHON" = "true" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Install Go
+# Install Go. TARGETARCH is supplied by BuildKit/buildx (amd64, arm64, ...) so
+# multi-arch builds fetch the right tarball; it falls back to amd64 for the
+# classic builder, which doesn't set it.
 ARG GO_VERSION=1.24.2
+ARG TARGETARCH
 RUN if [ "$INSTALL_GO" = "true" ]; then \
-        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xzf -; \
+        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH:-amd64}.tar.gz" | tar -C /usr/local -xzf -; \
     fi
 ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
 

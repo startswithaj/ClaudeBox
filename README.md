@@ -16,6 +16,21 @@ By default the container is sandboxed: it can reach the public internet but **no
 
 - [Docker](https://docs.docker.com/get-docker/) installed and running
 
+## Prebuilt images
+
+Each release is published to GitHub Container Registry for `linux/amd64` and `linux/arm64`, so you can skip the local build. You still need the `claudebox` wrapper script (see [Setup](#setup) below) — the prebuilt image just saves it from building one.
+
+Pull a release and tag it as the local image the wrapper looks for:
+
+```bash
+docker pull ghcr.io/startswithaj/claudebox:latest
+docker tag ghcr.io/startswithaj/claudebox:latest claudebox
+```
+
+Now run `claudebox` as usual — it finds the local `claudebox` image and won't rebuild. Pin a specific version with a tag like `:v1.0.0` instead of `:latest`. To update later, re-pull and re-tag.
+
+> The prebuilt image includes all optional languages (Go, Python, Rust). For a smaller image — or to go back to building from source — run `claudebox --build` (see [Custom builds](#custom-builds)).
+
 ## Setup
 
 1. Clone the repo:
@@ -67,10 +82,16 @@ claudebox --model sonnet
 
 ### Port forwarding
 
-Expose ports from the container to your machine (useful when Claude spins up a dev server):
+Publish a port so you can reach a server Claude starts inside the container. For example, if Claude runs a web frontend on port 3000 in the container, map it out and open it in your browser:
 
 ```bash
 claudebox -p 3000:3000
+# then visit http://localhost:3000 on your machine
+```
+
+The format is `-p HOST:CONTAINER`. Repeat the flag for multiple ports — say a frontend and its API:
+
+```bash
 claudebox -p 3000:3000 -p 8080:8080
 ```
 
@@ -117,7 +138,7 @@ claudebox --ssh -p 3000:3000 --docker --resume
 | `--host-docker` | Mount the host Docker socket — grants host-root power and escapes the sandbox; use only when you need the host's daemon |
 | `--allow-lan` | Allow the container to reach your local network (the LAN firewall is on by default) |
 | `--ssh` | Forward your local SSH agent into the container for git over SSH |
-| `-p`, `--port <host:container>` | Publish a container port to your host (repeatable) |
+| `-p`, `--port <host:container>` | Publish a container port to your host so you can reach it — e.g. `-p 3000:3000`, then open http://localhost:3000 (repeatable) |
 | `--build` | (Re)build the image before launching |
 | `--with <list>` | With `--build`, include only these optional languages: `go`, `python`, `rust` |
 | `--help`, `-h` | Show usage and exit |
