@@ -1,3 +1,10 @@
+# Docker CLI (+ buildx/compose plugins) sourced from the official multi-arch image
+FROM docker:28-cli AS dockercli
+
+# Rootless Docker daemon + extras. The dind-rootless image bundles both the
+# daemon binaries (dockerd/containerd/runc) and the rootless launcher/rootlesskit.
+FROM docker:28-dind-rootless AS dindrootless
+
 FROM node:24-bookworm
 
 # Avoid interactive prompts during package installation
@@ -13,6 +20,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     ca-certificates \
     openssh-client \
+    # Firewall for LAN egress blocking (CAP_NET_ADMIN is dropped afterwards via
+    # setpriv, which ships with the base image's util-linux)
+    iptables \
+    # Rootless Docker prerequisites: uidmap provides the setuid
+    # newuidmap/newgidmap helpers; slirp4netns provides rootless networking
+    uidmap \
+    slirp4netns \
     # Build essentials
     build-essential \
     cmake \
@@ -62,6 +76,33 @@ RUN if [ "$INSTALL_RUST" = "true" ]; then \
     fi
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Install Deno (installs to $DENO_INSTALL/bin)
+ENV DENO_INSTALL=/usr/local
+RUN curl -fsSL https://deno.land/install.sh | sh
+
+# Docker CLI (Docker-out-of-Docker: talks to the host daemon via the mounted
+# /var/run/docker.sock). Copied from the official image above — client only, no daemon.
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+
+# Docker daemon + runtime for rootless Docker (started on demand by the entrypoint
+# when claudebox is run with --docker). Lets the sandbox run its own isolated
+# Docker without mounting the host socket or using --privileged.
+COPY --from=dindrootless /usr/local/bin/dockerd /usr/local/bin/dockerd
+COPY --from=dindrootless /usr/local/bin/containerd /usr/local/bin/containerd
+COPY --from=dindrootless /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/containerd-shim-runc-v2
+COPY --from=dindrootless /usr/local/bin/runc /usr/local/bin/runc
+COPY --from=dindrootless /usr/local/bin/docker-proxy /usr/local/bin/docker-proxy
+COPY --from=dindrootless /usr/local/bin/dockerd-rootless.sh /usr/local/bin/dockerd-rootless.sh
+COPY --from=dindrootless /usr/local/bin/rootlesskit /usr/local/bin/rootlesskit
+COPY --from=dindrootless /usr/local/bin/rootlesskit-docker-proxy /usr/local/bin/rootlesskit-docker-proxy
+
+# The rootless daemon runs as the unprivileged 'node' user (uid 1000, already
+# present in the base image). Grant it a subordinate uid/gid range for the
+# user-namespace mapping rootless Docker needs.
+RUN echo "node:100000:65536" > /etc/subuid \
+    && echo "node:100000:65536" > /etc/subgid
+
 # Install Claude Code CLI via native installer
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:${PATH}"
@@ -72,4 +113,8 @@ RUN ln -sf /usr/bin/fdfind /usr/bin/fd
 # Default working directory where the host pwd will be mounted
 WORKDIR /workspace
 
-ENTRYPOINT ["claude"]
+# Entrypoint installs the optional LAN firewall, drops CAP_NET_ADMIN, then execs claude
+COPY entrypoint.sh /usr/local/bin/claudebox-entrypoint.sh
+RUN chmod +x /usr/local/bin/claudebox-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/claudebox-entrypoint.sh"]

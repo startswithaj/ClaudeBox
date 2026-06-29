@@ -2,19 +2,61 @@
 set -euo pipefail
 
 IMAGE_NAME="claudebox"
-CONTAINER_WORKDIR="/workspace"
+# Mount the project at its real host path (not /workspace) so Claude inside the
+# container stores sessions under the same ~/.claude/projects/<path> folder as a
+# native `claude` run — letting both resume each other's chats.
+CONTAINER_WORKDIR="$(pwd)"
 FORWARD_SSH=false
 DO_BUILD=false
 BUILD_WITH=""
+# LAN egress is blocked by default; the container reaches the internet but not
+# your local network. Docker access is off by default: --docker starts an
+# isolated rootless daemon inside the box (safe), while --host-docker mounts the
+# host socket (effectively host root — lets the container escape the sandbox).
+BLOCK_LAN=true
+RUN_DIND=false
+MOUNT_DOCKER_SOCK=false
 PORT_ARGS=()
 CLAUDE_ARGS=()
 
 # Available optional tools
 ALL_TOOLS="go,python,rust"
 
+print_help() {
+    cat <<'EOF'
+claudebox — run Claude Code in a sandboxed Docker container.
+
+Usage:
+  claudebox [claudebox flags] [claude flags]
+
+By default the container can reach the internet but not your local network,
+and has no Docker access. Any flags not listed below are passed through to
+Claude Code (e.g. --resume, --model, --print, --dangerously-skip-permissions).
+
+claudebox flags:
+  --docker             Start an isolated rootless Docker daemon inside the
+                       container (safe; your host's Docker is untouched).
+  --host-docker        Mount the host Docker socket. DANGEROUS: effectively host
+                       root — escapes the sandbox and bypasses the LAN firewall.
+                       Use only when you need the host's daemon.
+  --allow-lan          Allow the container to reach your local network
+                       (the LAN firewall is on by default).
+  --ssh                Forward your local SSH agent for git over SSH.
+  -p, --port <h:c>     Publish a container port to your host (repeatable).
+  --build              (Re)build the image before launching.
+  --with <list>        With --build, include only these optional languages:
+                       go, python, rust (comma-separated).
+  -h, --help           Show this help and exit.
+EOF
+}
+
 # Parse claudebox-specific flags, collect the rest for claude
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            print_help
+            exit 0
+            ;;
         --build)
             DO_BUILD=true
             shift
@@ -25,6 +67,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --ssh)
             FORWARD_SSH=true
+            shift
+            ;;
+        --allow-lan)
+            BLOCK_LAN=false
+            shift
+            ;;
+        --docker)
+            RUN_DIND=true
+            shift
+            ;;
+        --host-docker)
+            MOUNT_DOCKER_SOCK=true
             shift
             ;;
         -p|--port)
@@ -65,13 +119,10 @@ if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
     echo "Build complete." >&2
 fi
 
-# Generate a container name from the current directory
-CONTAINER_NAME="claudebox-$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
-
-# Collect volumes to mount
+# Collect volumes to mount. No fixed --name: Docker assigns a unique name so
+# claudebox can run multiple times (even in the same folder) without conflicts.
 DOCKER_ARGS=(
     --rm
-    --name "$CONTAINER_NAME"
     -v "$(pwd):${CONTAINER_WORKDIR}"
     -w "${CONTAINER_WORKDIR}"
 )
@@ -79,6 +130,24 @@ DOCKER_ARGS=(
 # Forward port mappings
 if [[ ${#PORT_ARGS[@]} -gt 0 ]]; then
     DOCKER_ARGS+=("${PORT_ARGS[@]}")
+fi
+
+# Block egress to the local network. NET_ADMIN lets the entrypoint install the
+# firewall rules; the entrypoint then drops the capability before launching
+# Claude so it can't undo them.
+if [[ "$BLOCK_LAN" == true ]]; then
+    DOCKER_ARGS+=(--cap-add=NET_ADMIN -e CLAUDEBOX_BLOCK_LAN=true)
+fi
+
+# Run an isolated, rootless Docker daemon inside the container (--docker). It
+# needs unconfined seccomp/apparmor to set up its user namespaces, but NOT
+# --privileged or host root, so the sandbox boundary holds.
+if [[ "$RUN_DIND" == true ]]; then
+    DOCKER_ARGS+=(
+        -e CLAUDEBOX_DIND=true
+        --security-opt seccomp=unconfined
+        --security-opt apparmor=unconfined
+    )
 fi
 
 # Forward SSH agent if requested and available
@@ -107,25 +176,51 @@ if [[ -f "$CLAUDE_CONFIG_FILE" ]]; then
     DOCKER_ARGS+=(-v "${CLAUDE_CONFIG_FILE}:/root/.claude.json")
 fi
 
-# On macOS, Claude Code stores the OAuth token in the Keychain rather than in a
+# On macOS, Claude Code stores the OAuth credential in the Keychain rather than a
 # file, so the Linux container has no credentials and reports "not logged in".
-# Export the Keychain credential to a file the container reads (~/.claude/.credentials.json).
+# Read the Keychain credential (the full JSON blob, incl. refresh token) and
+# forward it as an env var *by name* — so the value never lands on the host disk
+# or in the process list. The container's entrypoint writes it to
+# ~/.claude/.credentials.json. On Linux hosts the credential is already a file in
+# the mounted ~/.claude, so this is skipped.
 if [[ "$(uname)" == "Darwin" ]]; then
-    SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-    CREDS_FILE="${SCRIPT_DIR}/.claudebox-credentials.json"
-    if security find-generic-password -s "Claude Code-credentials" -w >"$CREDS_FILE" 2>/dev/null \
-        && [[ -s "$CREDS_FILE" ]]; then
-        chmod 600 "$CREDS_FILE"
-        DOCKER_ARGS+=(-v "${CREDS_FILE}:/root/.claude/.credentials.json")
+    if CLAUDEBOX_CREDENTIALS="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)" \
+        && [[ -n "$CLAUDEBOX_CREDENTIALS" ]]; then
+        export CLAUDEBOX_CREDENTIALS
+        DOCKER_ARGS+=(-e CLAUDEBOX_CREDENTIALS)
     else
-        rm -f "$CREDS_FILE"
         echo "Warning: could not read Claude credentials from the macOS Keychain." >&2
+    fi
+fi
+
+# Forward the host Docker socket so the container can drive the host's daemon
+# (--host-docker). Opt-in because socket access is effectively root on the host
+# and lets the container escape the sandbox (and bypass the LAN firewall). Use
+# --docker instead for an isolated daemon unless you specifically need the host's.
+DOCKER_SOCK="/var/run/docker.sock"
+if [[ "$MOUNT_DOCKER_SOCK" == true ]]; then
+    if [[ -S "$DOCKER_SOCK" ]]; then
+        DOCKER_ARGS+=(-v "${DOCKER_SOCK}:/var/run/docker.sock")
+    else
+        echo "Warning: --host-docker passed but $DOCKER_SOCK not found." >&2
     fi
 fi
 
 # Allocate a TTY if stdin is a terminal (interactive use)
 if [ -t 0 ]; then
     DOCKER_ARGS+=(-it)
+fi
+
+# Warn whenever a flag weakens the sandbox boundary
+if [[ "$BLOCK_LAN" != true ]]; then
+    echo "⚠️  --allow-lan: the container can reach your local network (LAN, router, metadata endpoints)." >&2
+fi
+if [[ "$MOUNT_DOCKER_SOCK" == true ]]; then
+    echo "⚠️  --host-docker: the host Docker socket is mounted. This grants effective host root and lets the" >&2
+    echo "    container escape the sandbox and bypass the LAN firewall. Only use with trusted sessions." >&2
+fi
+if [[ "$RUN_DIND" == true ]]; then
+    echo "🐳 --docker: starting an isolated rootless Docker daemon inside the container (host Docker untouched)." >&2
 fi
 
 exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
