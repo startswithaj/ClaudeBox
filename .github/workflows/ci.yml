@@ -1,30 +1,46 @@
-name: Release image
+name: CI
 
-# On every merge/push to main: bump a SemVer tag, then build and publish the
-# image to GitHub Container Registry for linux/amd64 + linux/arm64.
-#
-# The bump is patch by default; include "#minor" or "#major" anywhere in the
-# latest commit message (e.g. the merge commit) to bump more. Can also be run
-# manually from the Actions tab.
-#
-# Note: arm64 builds under QEMU emulation, so each release takes a while.
+# Pull requests: run the test bed only.
+# Pushes to main (and manual runs): run the test bed, then — only if it passes —
+# bump a SemVer tag and publish the image to GHCR for linux/amd64 + linux/arm64.
 
 on:
+  pull_request:
   push:
     branches:
       - main
   workflow_dispatch:
 
 permissions:
-  contents: write # create and push the version tag
-  packages: write # push the image to ghcr
-
-env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  contents: read
 
 jobs:
-  release:
+  test:
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Ubuntu 24.04 (the ubuntu-latest runner) restricts unprivileged user
+      # namespaces via AppArmor, which the rootless Docker test needs. Relax it
+      # so the --docker check can create its namespace. Harmless on kernels
+      # without the knob.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Run test bed
+        run: test/run.sh
+
+  release:
+    # Publish only from main / manual runs, and only after the tests pass.
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create and push the version tag
+      packages: write # push the image to ghcr
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
