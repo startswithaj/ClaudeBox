@@ -24,9 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # setpriv, which ships with the base image's util-linux)
     iptables \
     # Rootless Docker prerequisites: uidmap provides the setuid
-    # newuidmap/newgidmap helpers; slirp4netns provides rootless networking
+    # newuidmap/newgidmap helpers; slirp4netns + iproute2 (the `ip` command)
+    # provide rootless networking
     uidmap \
     slirp4netns \
+    iproute2 \
     # Build essentials
     build-essential \
     cmake \
@@ -93,9 +95,14 @@ COPY --from=dindrootless /usr/local/bin/containerd /usr/local/bin/containerd
 COPY --from=dindrootless /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/containerd-shim-runc-v2
 COPY --from=dindrootless /usr/local/bin/runc /usr/local/bin/runc
 COPY --from=dindrootless /usr/local/bin/docker-proxy /usr/local/bin/docker-proxy
-COPY --from=dindrootless /usr/local/bin/dockerd-rootless.sh /usr/local/bin/dockerd-rootless.sh
+COPY --from=dindrootless /usr/local/bin/docker-init /usr/local/bin/docker-init
 COPY --from=dindrootless /usr/local/bin/rootlesskit /usr/local/bin/rootlesskit
-COPY --from=dindrootless /usr/local/bin/rootlesskit-docker-proxy /usr/local/bin/rootlesskit-docker-proxy
+# The dind-rootless image no longer ships the launcher script, so vendor the
+# version-matched one from moby. It drives rootlesskit with the builtin port
+# driver, so no separate rootlesskit-docker-proxy helper is needed.
+RUN curl -fsSL https://raw.githubusercontent.com/moby/moby/v28.5.2/contrib/dockerd-rootless.sh \
+        -o /usr/local/bin/dockerd-rootless.sh \
+    && chmod +x /usr/local/bin/dockerd-rootless.sh
 
 # The rootless daemon runs as the unprivileged 'node' user (uid 1000, already
 # present in the base image). Grant it a subordinate uid/gid range for the

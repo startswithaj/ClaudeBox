@@ -63,7 +63,7 @@ start_rootless_dockerd() {
     setpriv --reuid=node --regid=node --init-groups \
         env HOME=/home/node \
             XDG_RUNTIME_DIR="$runtime_dir" \
-            PATH="/usr/local/bin:/usr/bin:/bin" \
+            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             dockerd-rootless.sh >/var/log/dockerd-rootless.log 2>&1 &
 
     # Point the (root) docker CLI Claude runs at the rootless daemon's socket.
@@ -103,7 +103,7 @@ fi
 # set as (file caps | root-default) & bounding set, so removing it here means
 # Claude starts without it and can't reacquire it to undo the firewall.
 if [[ "$FIREWALL_APPLIED" == true ]]; then
-    exec setpriv --bounding-set -cap_net_admin claude "$@"
+    exec setpriv --bounding-set -net_admin claude "$@"
 fi
 
 exec claude "$@"
