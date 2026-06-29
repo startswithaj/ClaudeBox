@@ -21,6 +21,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Ubuntu 24.04 (the ubuntu-latest runner) restricts unprivileged user
+      # namespaces via AppArmor, which the rootless Docker test needs. Relax it
+      # so the --docker check can create its namespace. Harmless on kernels
+      # without the knob.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: Run test bed
         run: test/run.sh
 
