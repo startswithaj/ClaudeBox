@@ -1,2 +1,3 @@
 .claudebox-credentials.json
 .DS_Store
+test/build.log
