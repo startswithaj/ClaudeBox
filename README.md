@@ -176,3 +176,13 @@ Optional (included by default, configurable with `--with`):
 - **Go** 1.24
 - **Python** 3 + pip + venv
 - **Rust** (stable via rustup)
+
+## Testing
+
+`test/run.sh` builds a lean image and verifies the sandbox end to end — the firewall rules, the `CAP_NET_ADMIN` drop, internet egress, LAN blocking, and rootless Docker (`--docker`). Run it after changing the Dockerfile, the entrypoint, or the `claudebox` wrapper:
+
+```bash
+test/run.sh
+```
+
+It exits non-zero if any check fails. On hosts that block the user-namespace mapping rootless Docker needs (e.g. some nested CI containers), the rootless test automatically falls back to `--privileged` and says so — normal `claudebox --docker` runs unprivileged.
