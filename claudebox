@@ -152,7 +152,11 @@ fi
 
 # Forward SSH agent if requested and available
 if [[ "$FORWARD_SSH" == true ]]; then
-    if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # Docker Desktop proxies the host SSH agent at this fixed path. The real
+        # macOS $SSH_AUTH_SOCK lives outside the Linux VM and can't be mounted.
+        DOCKER_ARGS+=(-v /run/host-services/ssh-auth.sock:/tmp/ssh-agent.sock -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+    elif [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
         DOCKER_ARGS+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
     else
         echo "Warning: --ssh passed but SSH_AUTH_SOCK is not set." >&2
