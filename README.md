@@ -50,6 +50,21 @@ echo 'alias claude="claudebox"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
+## Prebuilt images
+
+Each release is published to GitHub Container Registry for `linux/amd64` and `linux/arm64`, so you can skip the local build. You still need the `claudebox` wrapper script (from [Setup](#setup)) — it just runs the prebuilt image instead of building one.
+
+Pull a release and tag it as the local image the wrapper looks for:
+
+```bash
+docker pull ghcr.io/startswithaj/claudebox:latest
+docker tag ghcr.io/startswithaj/claudebox:latest claudebox
+```
+
+Now run `claudebox` as usual — it finds the local `claudebox` image and won't rebuild. Pin a specific version with a tag like `:v1.0.0` instead of `:latest`. To update later, re-pull and re-tag.
+
+> The prebuilt image includes all optional languages (Go, Python, Rust). For a smaller image — or to go back to building from source — run `claudebox --build` (see [Custom builds](#custom-builds)).
+
 ## Usage
 
 ```bash
