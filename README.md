@@ -6,9 +6,18 @@
 
 Run Claude Code in a sandboxed Docker container.
 
-It works exactly the same as running `claude` locally — same interactive interface, same commands, same config. Your project directory is mounted in so Claude can read and edit your files, and your `~/.claude` config is shared so settings, memory, and auth persist between sessions.
+**How it works:** `claudebox` is a Bash wrapper around a single `docker run` — no daemon, no background process. Each time you run it, the script:
 
-By default the container is sandboxed: it can reach the public internet but **not your local network** (other machines, your router, cloud metadata endpoints), and it has **no access to Docker** unless you ask for it. This makes it a reasonable place to run Claude with `--dangerously-skip-permissions`. See [Sandboxing](#sandboxing).
+1. **Splits the arguments** — its own flags (`--docker`, `--ssh`, `-p`, `--build`, …) are handled locally; everything else is passed straight through to `claude` in the container.
+2. **Ensures the image exists** — builds it on first run (`docker build`), reuses it after; `--build` forces a rebuild.
+3. **Assembles the `docker run`**, mainly:
+   - mounts your project at its **real host path** (not `/workspace`) and works there, so file paths and `~/.claude/projects/<path>` session files line up with a native `claude` run;
+   - mounts `~/.claude` (and `~/.claude.json`) so config, memory, and auth persist — on macOS it reads your Keychain token and forwards it in as an env var;
+   - by default adds `--cap-add=NET_ADMIN` plus an env flag that tells the container to firewall off your LAN; `-p`, `--ssh`, and `--docker`/`--host-docker` add ports, the SSH agent, and Docker access;
+   - allocates a TTY so the session is interactive.
+4. **Hands off to the container's entrypoint**, which installs the LAN firewall, then **drops `NET_ADMIN` before launching Claude** (so Claude can't undo it), optionally starts a rootless Docker daemon, and finally `exec`s `claude` with your passed-through arguments.
+
+Net effect: the same Claude on your real files, with config/memory persisted, the network sandboxed to internet-only, and Docker off unless you opt in — isolated enough to run `--dangerously-skip-permissions`. See [Sandboxing](#sandboxing) for specifics.
 
 > **Note (macOS):** If you use a Claude subscription (Pro/Max), your auth token lives in the macOS Keychain, which the container can't read directly. claudebox reads it and forwards it into the container automatically, so auth just works. If that ever fails (you'll see a warning), run `/login` once inside the container — the token is then saved to `~/.claude` and persists across sessions.
 
@@ -79,6 +88,8 @@ claudebox --resume
 claudebox --print "explain this repo"
 claudebox --model sonnet
 ```
+
+> **Tip:** While Claude's interactive UI is running, the terminal captures the mouse, so a normal click-drag won't select text. Hold **Option (⌥)** while dragging to select and copy in macOS terminals (iTerm2/Terminal.app); on most Linux terminals it's **Shift**.
 
 ### Port forwarding
 
