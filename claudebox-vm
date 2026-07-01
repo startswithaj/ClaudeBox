@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# claudebox-vm — run Claude Code inside an isolated macOS VM (host-parity sandbox).
+#
+# PROTOTYPE / UNTESTED end to end: needs `tart` and a prepared base VM image,
+# and a Mac with enough free disk for a macOS image (~60GB+). It has not been run
+# against a real image yet — treat it as the concrete design, not a finished tool.
+#
+# Unlike `claudebox` (a Linux container), this boots a real macOS guest so the
+# sandbox mirrors the host userland exactly (BSD tools, Keychain, macOS paths).
+# It leans on tart, which does the Virtualization.framework work: APFS
+# copy-on-write clone of a base image, CPU/memory config, headless boot, and IP
+# discovery. Each run clones the base, boots it, seeds credentials, runs Claude
+# over SSH against the mounted project, then deletes the clone on exit.
+#
+# One-time base prep (not done here):
+#   - tart pull/clone a macOS base into $BASE (e.g. a cirruslabs macos image)
+#   - provision it to match your host (Brewfile, dotfiles) — this is the manual
+#     "mirror" step; there is no auto-sync
+#   - install your SSH public key into the base's ~admin/.ssh/authorized_keys so
+#     this script can SSH in non-interactively
+#
+# Usage: claudebox-vm [flags] [claude args...]
+set -euo pipefail
+
+BASE="${CLAUDEBOX_VM_BASE:-claudebox-base}"   # prepared base image (the template)
+CPUS="${CLAUDEBOX_VM_CPUS:-4}"
+MEMORY="${CLAUDEBOX_VM_MEMORY:-8192}"          # MiB
+SSH_USER="${CLAUDEBOX_VM_USER:-admin}"
+KEEP=false                                     # keep the clone after exit (debug)
+CLAUDE_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --base)   BASE="$2"; shift 2 ;;
+        --cpus)   CPUS="$2"; shift 2 ;;
+        --memory) MEMORY="$2"; shift 2 ;;
+        --user)   SSH_USER="$2"; shift 2 ;;
+        --keep)   KEEP=true; shift ;;
+        -h|--help)
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) CLAUDE_ARGS+=("$1"); shift ;;
+    esac
+done
+
+command -v tart >/dev/null 2>&1 || {
+    echo "Error: tart is not installed. Install with: brew install cirruslabs/cli/tart" >&2
+    exit 1
+}
+tart list >/dev/null 2>&1 || { echo "Error: tart is not responding." >&2; exit 1; }
+if ! tart list 2>/dev/null | awk '{print $2}' | grep -qx "$BASE"; then
+    echo "Error: base VM '$BASE' not found. Prepare it first (see header)." >&2
+    exit 1
+fi
+
+PROJECT="$(pwd)"
+# Distinct per-run clone name. No Math.random available; use PID + seconds.
+CLONE="cbx-$$-$(date +%s)"
+
+# Always tear the clone down on exit (unless --keep). Stopping first releases the
+# APFS clone; delete reclaims the diverged blocks.
+cleanup() {
+    [[ "$KEEP" == true ]] && { echo "Kept VM: $CLONE (delete with: tart delete $CLONE)" >&2; return; }
+    tart stop "$CLONE" >/dev/null 2>&1 || true
+    tart delete "$CLONE" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+echo "claudebox-vm settings:" >&2
+echo "  base    : $BASE" >&2
+echo "  clone   : $CLONE" >&2
+echo "  cpus    : $CPUS" >&2
+echo "  memory  : ${MEMORY} MiB" >&2
+echo "  project : $PROJECT" >&2
+
+# APFS copy-on-write clone of the base — near-instant, near-zero disk up front.
+tart clone "$BASE" "$CLONE"
+tart set "$CLONE" --cpu "$CPUS" --memory "$MEMORY"
+
+# Share the project and the host ~/.claude into the guest (read-write). tart
+# mounts shares under /Volumes/My Shared Files/<name>; we symlink to the real
+# paths below so Claude's session files line up with a native run.
+DIRS=(--dir "project:$PROJECT")
+[[ -d "$HOME/.claude" ]] && DIRS+=(--dir "claudehome:$HOME/.claude")
+
+# Boot headless. The `tart run` process owns the VM's lifetime, so it stays in
+# the background for the whole session.
+tart run "$CLONE" --no-graphics "${DIRS[@]}" >/dev/null 2>&1 &
+RUN_PID=$!
+
+# Wait for the guest to get an IP.
+IP=""
+for _ in $(seq 1 60); do
+    IP="$(tart ip "$CLONE" 2>/dev/null || true)"
+    [[ -n "$IP" ]] && break
+    sleep 1
+done
+[[ -n "$IP" ]] || { echo "Error: VM never reported an IP." >&2; exit 1; }
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o ConnectTimeout=5 -o LogLevel=ERROR)
+vm_ssh() { ssh "${SSH_OPTS[@]}" "${SSH_USER}@${IP}" "$@"; }
+
+# Wait for SSH to accept connections (base image must trust our key — see header).
+for _ in $(seq 1 60); do
+    vm_ssh true 2>/dev/null && break
+    sleep 1
+done
+vm_ssh true 2>/dev/null || { echo "Error: SSH to $IP never came up." >&2; exit 1; }
+
+SHARE_ROOT="/Volumes/My Shared Files"
+
+# Map the project to its real host path inside the guest so Claude stores
+# sessions under ~/.claude/projects/<same-path> as a native run would. Needs
+# sudo to create dirs under /Users; falls back to the share path if it can't.
+REMOTE_DIR="${SHARE_ROOT}/project"
+if vm_ssh "sudo mkdir -p '$(dirname "$PROJECT")' && sudo ln -sfn '${SHARE_ROOT}/project' '$PROJECT'" >/dev/null 2>&1; then
+    REMOTE_DIR="$PROJECT"
+else
+    echo "Warning: couldn't map project to its host path; using the share path." >&2
+fi
+
+# Point the guest's ~/.claude at the shared host config so settings/memory/
+# sessions persist and match the host (best-effort).
+if [[ -d "$HOME/.claude" ]]; then
+    vm_ssh "rm -rf ~/.claude && ln -sfn '${SHARE_ROOT}/claudehome' ~/.claude" >/dev/null 2>&1 \
+        || echo "Warning: couldn't link ~/.claude in the guest." >&2
+fi
+
+# Copy ~/.claude.json in. It's a file (not shareable via tart --dir) and holds
+# the logged-in account state, onboarding flag, and much of your config. Without
+# it the interactive TUI treats the guest as a fresh install ("not logged in",
+# no settings) even when the Keychain token is present.
+if [[ -f "$HOME/.claude.json" ]]; then
+    vm_ssh "cat > ~/.claude.json" < "$HOME/.claude.json" >/dev/null 2>&1 \
+        || echo "Warning: couldn't copy ~/.claude.json into the guest." >&2
+fi
+
+# Seed the guest Keychain with the host's Claude credential (macOS stores it
+# there, not in a file). The blob is piped over SSH stdin (so its JSON quotes
+# need no escaping) and read with $(cat). SSH sessions start with the login
+# keychain locked, so unlock it first, then add the item.
+if BLOB="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)" && [[ -n "$BLOB" ]]; then
+    if printf '%s' "$BLOB" | vm_ssh "security unlock-keychain -p '${CLAUDEBOX_VM_PASS:-admin}' login.keychain 2>/dev/null; security add-generic-password -U -s 'Claude Code-credentials' -a '$SSH_USER' -w \"\$(cat)\"" >/dev/null 2>&1; then
+        :
+    else
+        echo "Warning: failed to seed Claude credential into the VM Keychain." >&2
+    fi
+else
+    echo "Warning: no Claude credential found in the host Keychain." >&2
+fi
+
+# Run Claude in the mounted project. -t for an interactive TTY. The Claude CLI
+# installs to ~/.local/bin, which a non-interactive SSH shell doesn't have on
+# PATH, so add it explicitly.
+ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${IP}" \
+    "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd '$REMOTE_DIR' && claude ${CLAUDE_ARGS[*]:-}"

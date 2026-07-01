@@ -198,6 +198,17 @@ Optional (included by default, configurable with `--with`):
 - **Python** 3 + pip + venv
 - **Rust** (stable via rustup)
 
+## Experimental: macOS VM backend
+
+`claudebox` sandboxes Claude in a **Linux container**. For a sandbox that mirrors
+your Mac's userland exactly (BSD tools, Keychain, macOS paths) there's an
+experimental **macOS VM** backend, `claudebox-vm`, built on [tart]. It clones a
+prepared macOS base image, boots it, and runs Claude over SSH with your project
+and credentials forwarded in. See **[claudebox-vm.md](claudebox-vm.md)** for
+dependencies and setup. (Prototype — Apple Silicon only.)
+
+[tart]: https://tart.run
+
 ## Testing
 
 There are three suites. Run them after changing the Dockerfile, the entrypoint, or the `claudebox` wrapper:
