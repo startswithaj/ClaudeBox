@@ -26,13 +26,19 @@ if [[ "${CLAUDEBOX_BLOCK_LAN:-false}" == "true" ]]; then
 fi
 
 if [[ "${CLAUDEBOX_DIND:-false}" == "true" ]]; then
-    echo "[dind] rootless daemon reachable + runs a container"
-    if docker version >/dev/null 2>&1 && docker run --rm hello-world 2>/dev/null | grep -qi "hello from docker"; then
-        pass "rootless docker ran hello-world"
+    # rootful under Apple container (its own micro-VM), rootless under Docker
+    if [[ "${CLAUDEBOX_DIND_ROOTFUL:-false}" == "true" ]]; then
+        mode="rootful"; dind_log="/var/log/dockerd.log"
     else
-        fail "rootless docker not working"
-        echo "      --- dockerd-rootless.log (tail) ---"
-        tail -8 /var/log/dockerd-rootless.log 2>/dev/null | sed 's/^/      /'
+        mode="rootless"; dind_log="/var/log/dockerd-rootless.log"
+    fi
+    echo "[dind] $mode daemon reachable + runs a container"
+    if docker version >/dev/null 2>&1 && docker run --rm hello-world 2>/dev/null | grep -qi "hello from docker"; then
+        pass "$mode docker ran hello-world"
+    else
+        fail "$mode docker not working"
+        echo "      --- $(basename "$dind_log") (tail) ---"
+        tail -8 "$dind_log" 2>/dev/null | sed 's/^/      /'
     fi
 fi
 

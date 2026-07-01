@@ -1,0 +1,44 @@
+name: CI
+
+# Runs the test suites on push and pull requests.
+#
+# The launcher unit tests and the Docker integration tests run on GitHub-hosted
+# Linux runners. The Apple `container` integration test needs a real Apple
+# Silicon Mac (macOS 26+) with nested virtualization — which GitHub-hosted macOS
+# runners do NOT provide — so it only runs on a self-hosted macOS runner, gated
+# behind the HAS_MACOS_RUNNER repository variable. Set that variable to 'true'
+# once you have such a runner registered; until then the job is skipped.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Launcher + Docker (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Launcher unit tests
+        run: test/unit.sh
+
+      - name: Docker integration tests
+        run: test/run.sh
+
+  container:
+    name: Apple container integration (self-hosted macOS)
+    # GitHub-hosted macOS runners can't run Apple `container` (no nested virt),
+    # so this targets a self-hosted Apple Silicon runner and is skipped unless
+    # the repo variable HAS_MACOS_RUNNER is set to 'true'.
+    if: ${{ vars.HAS_MACOS_RUNNER == 'true' }}
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apple container integration tests
+        run: test/run-container.sh

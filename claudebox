@@ -17,21 +17,43 @@ BLOCK_LAN=true
 RUN_DIND=false
 MOUNT_DOCKER_SOCK=false
 PORT_ARGS=()
+EXTRA_MOUNTS=()
 CLAUDE_ARGS=()
+
+# Container runtime. Prefer Apple `container` when it's present and running —
+# each container is its own hypervisor-isolated micro-VM, which (unlike Docker
+# Desktop) can host a working Docker daemon inside the sandbox. Otherwise fall
+# back to Docker. Override with --runtime or CLAUDEBOX_RUNTIME=container|docker.
+RUNTIME="${CLAUDEBOX_RUNTIME:-}"
+
+# Resolve a host path to its absolute form (works for files and dirs). Returns
+# non-zero if the path doesn't exist.
+resolve_path() {
+    local p="$1"
+    if [[ -d "$p" ]]; then
+        (cd "$p" && pwd)
+    elif [[ -e "$p" ]]; then
+        printf '%s/%s' "$(cd "$(dirname "$p")" && pwd)" "$(basename "$p")"
+    else
+        return 1
+    fi
+}
 
 # Available optional tools
 ALL_TOOLS="go,python,rust"
 
 print_help() {
     cat <<'EOF'
-claudebox — run Claude Code in a sandboxed Docker container.
+claudebox — run Claude Code in a sandboxed container.
 
 Usage:
   claudebox [claudebox flags] [claude flags]
 
-By default the container can reach the internet but not your local network,
-and has no Docker access. Any flags not listed below are passed through to
-Claude Code (e.g. --resume, --model, --print, --dangerously-skip-permissions).
+Uses Apple `container` when it's installed and running (each container is its
+own micro-VM), otherwise Docker. By default the container can reach the internet
+but not your local network, and has no Docker access. Any flags not listed below
+are passed through to Claude Code (e.g. --resume, --model, --print,
+--dangerously-skip-permissions).
 
 claudebox flags:
   --docker             Start an isolated rootless Docker daemon inside the
@@ -43,6 +65,11 @@ claudebox flags:
                        (the LAN firewall is on by default).
   --ssh                Forward your local SSH agent for git over SSH.
   -p, --port <h:c>     Publish a container port to your host (repeatable).
+  --mount <path>       Also mount a host path into the container at the same
+                       path (repeatable). Useful for handing Claude files that
+                       live outside the project dir, e.g. screenshots.
+  --runtime <name>     Force the container runtime: container or docker
+                       (default: auto — container if available, else docker).
   --build              (Re)build the image before launching.
   --with <list>        With --build, include only these optional languages:
                        go, python, rust (comma-separated).
@@ -81,8 +108,16 @@ while [[ $# -gt 0 ]]; do
             MOUNT_DOCKER_SOCK=true
             shift
             ;;
+        --runtime)
+            RUNTIME="$2"
+            shift 2
+            ;;
         -p|--port)
             PORT_ARGS+=(-p "$2")
+            shift 2
+            ;;
+        --mount)
+            EXTRA_MOUNTS+=("$2")
             shift 2
             ;;
         *)
@@ -91,6 +126,35 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# On Apple Silicon Macs, recommend Apple's `container` runtime when it isn't
+# installed. Unlike Docker Desktop's single shared LinuxKit VM, `container` runs
+# each container in its own micro-VM — stronger isolation, and the only way to
+# run a working Docker daemon *inside* the sandbox (see --docker) on macOS.
+if [[ "$(uname)" == "Darwin" && "$(uname -m)" == "arm64" ]] \
+    && ! command -v container >/dev/null 2>&1; then
+    echo "💡 You're on Apple Silicon. Consider installing Apple's 'container' runtime for" >&2
+    echo "   stronger per-container VM isolation (and working Docker-in-sandbox):" >&2
+    echo "   https://github.com/apple/container/releases" >&2
+fi
+
+# Resolve the container runtime: an explicit choice wins, otherwise prefer Apple
+# `container` when it's installed and its services are running, else Docker.
+if [[ -z "$RUNTIME" ]]; then
+    if command -v container >/dev/null 2>&1 && container system status >/dev/null 2>&1; then
+        RUNTIME=container
+    elif command -v docker >/dev/null 2>&1; then
+        RUNTIME=docker
+    else
+        echo "Error: no container runtime found. Install Apple 'container' (macOS 26+," >&2
+        echo "       Apple Silicon) or Docker, then re-run." >&2
+        exit 1
+    fi
+fi
+if ! command -v "$RUNTIME" >/dev/null 2>&1; then
+    echo "Error: requested runtime '$RUNTIME' is not on PATH." >&2
+    exit 1
+fi
 
 # Build the image if requested
 if [[ "$DO_BUILD" == true ]]; then
@@ -107,21 +171,21 @@ if [[ "$DO_BUILD" == true ]]; then
         done
     fi
 
-    echo "Building claudebox image..." >&2
-    docker build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    echo "Building claudebox image ($RUNTIME)..." >&2
+    "$RUNTIME" build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$IMAGE_NAME" "$SCRIPT_DIR"
     echo "Build complete." >&2
 fi
 
-if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
+if ! "$RUNTIME" image inspect "$IMAGE_NAME" &>/dev/null; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    echo "claudebox image not found. Building..." >&2
-    docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
+    echo "claudebox image not found. Building ($RUNTIME)..." >&2
+    "$RUNTIME" build -t "$IMAGE_NAME" "$SCRIPT_DIR"
     echo "Build complete." >&2
 fi
 
 # Collect volumes to mount. No fixed --name: Docker assigns a unique name so
 # claudebox can run multiple times (even in the same folder) without conflicts.
-DOCKER_ARGS=(
+RUN_ARGS=(
     --rm
     -v "$(pwd):${CONTAINER_WORKDIR}"
     -w "${CONTAINER_WORKDIR}"
@@ -129,35 +193,66 @@ DOCKER_ARGS=(
 
 # Forward port mappings
 if [[ ${#PORT_ARGS[@]} -gt 0 ]]; then
-    DOCKER_ARGS+=("${PORT_ARGS[@]}")
+    RUN_ARGS+=("${PORT_ARGS[@]}")
 fi
+
+# Mount any extra host paths (--mount) at the same path inside the container, so
+# a path Claude is given resolves identically inside and out. Non-existent paths
+# are skipped with a warning rather than failing the whole launch.
+EXTRA_MOUNT_PATHS=()
+for raw in ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}; do
+    if abs="$(resolve_path "$raw")"; then
+        RUN_ARGS+=(-v "${abs}:${abs}")
+        EXTRA_MOUNT_PATHS+=("$abs")
+    else
+        echo "Warning: --mount path not found, skipping: $raw" >&2
+    fi
+done
 
 # Block egress to the local network. NET_ADMIN lets the entrypoint install the
 # firewall rules; the entrypoint then drops the capability before launching
 # Claude so it can't undo them.
 if [[ "$BLOCK_LAN" == true ]]; then
-    DOCKER_ARGS+=(--cap-add=NET_ADMIN -e CLAUDEBOX_BLOCK_LAN=true)
+    RUN_ARGS+=(--cap-add NET_ADMIN -e CLAUDEBOX_BLOCK_LAN=true)
 fi
 
-# Run an isolated, rootless Docker daemon inside the container (--docker). It
-# needs unconfined seccomp/apparmor to set up its user namespaces, but NOT
-# --privileged or host root, so the sandbox boundary holds.
+# Run an isolated Docker daemon inside the container (--docker).
 if [[ "$RUN_DIND" == true ]]; then
-    DOCKER_ARGS+=(
-        -e CLAUDEBOX_DIND=true
-        --security-opt seccomp=unconfined
-        --security-opt apparmor=unconfined
-    )
+    RUN_ARGS+=(-e CLAUDEBOX_DIND=true)
+    if [[ "$RUNTIME" == container ]]; then
+        # Apple container: the box is its own micro-VM, so grant full caps and let
+        # the entrypoint run a normal rootful daemon inside it. Full power stays
+        # within the disposable VM, isolated from the host by the hypervisor —
+        # which is why Docker-in-sandbox works here but not under Docker Desktop.
+        RUN_ARGS+=(--cap-add ALL -e CLAUDEBOX_DIND_ROOTFUL=true)
+    else
+        # Docker: a rootless daemon needs unconfined seccomp/apparmor to set up its
+        # user namespaces, but NOT --privileged or host root, so the sandbox
+        # boundary holds. (Works on native Linux hosts; the nested user-namespace
+        # step is blocked under Docker Desktop.)
+        RUN_ARGS+=(
+            --security-opt seccomp=unconfined
+            --security-opt apparmor=unconfined
+        )
+    fi
 fi
 
 # Forward SSH agent if requested and available
 if [[ "$FORWARD_SSH" == true ]]; then
-    if [[ "$(uname)" == "Darwin" ]]; then
+    if [[ "$RUNTIME" == container ]]; then
+        # Apple container proxies host unix sockets into the guest, so the real
+        # macOS $SSH_AUTH_SOCK can be bind-mounted directly (no Docker Desktop proxy).
+        if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+            RUN_ARGS+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+        else
+            echo "Warning: --ssh under Apple container needs SSH_AUTH_SOCK set on the host." >&2
+        fi
+    elif [[ "$(uname)" == "Darwin" ]]; then
         # Docker Desktop proxies the host SSH agent at this fixed path. The real
         # macOS $SSH_AUTH_SOCK lives outside the Linux VM and can't be mounted.
-        DOCKER_ARGS+=(-v /run/host-services/ssh-auth.sock:/tmp/ssh-agent.sock -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+        RUN_ARGS+=(-v /run/host-services/ssh-auth.sock:/tmp/ssh-agent.sock -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
     elif [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
-        DOCKER_ARGS+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
+        RUN_ARGS+=(-v "${SSH_AUTH_SOCK}:/tmp/ssh-agent.sock" -e "SSH_AUTH_SOCK=/tmp/ssh-agent.sock")
     else
         echo "Warning: --ssh passed but SSH_AUTH_SOCK is not set." >&2
     fi
@@ -165,19 +260,19 @@ fi
 
 # Forward the Anthropic API key if set
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    DOCKER_ARGS+=(-e "ANTHROPIC_API_KEY")
+    RUN_ARGS+=(-e "ANTHROPIC_API_KEY")
 fi
 
 # Forward Claude config directory so settings/memory persist
 CLAUDE_CONFIG_DIR="${HOME}/.claude"
 if [[ -d "$CLAUDE_CONFIG_DIR" ]]; then
-    DOCKER_ARGS+=(-v "${CLAUDE_CONFIG_DIR}:/root/.claude")
+    RUN_ARGS+=(-v "${CLAUDE_CONFIG_DIR}:/root/.claude")
 fi
 
 # Forward Claude config file (.claude.json) if it exists
 CLAUDE_CONFIG_FILE="${HOME}/.claude.json"
 if [[ -f "$CLAUDE_CONFIG_FILE" ]]; then
-    DOCKER_ARGS+=(-v "${CLAUDE_CONFIG_FILE}:/root/.claude.json")
+    RUN_ARGS+=(-v "${CLAUDE_CONFIG_FILE}:/root/.claude.json")
 fi
 
 # On macOS, Claude Code stores the OAuth credential in the Keychain rather than a
@@ -191,7 +286,7 @@ if [[ "$(uname)" == "Darwin" ]]; then
     if CLAUDEBOX_CREDENTIALS="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)" \
         && [[ -n "$CLAUDEBOX_CREDENTIALS" ]]; then
         export CLAUDEBOX_CREDENTIALS
-        DOCKER_ARGS+=(-e CLAUDEBOX_CREDENTIALS)
+        RUN_ARGS+=(-e CLAUDEBOX_CREDENTIALS)
     else
         echo "Warning: could not read Claude credentials from the macOS Keychain." >&2
     fi
@@ -203,17 +298,59 @@ fi
 # --docker instead for an isolated daemon unless you specifically need the host's.
 DOCKER_SOCK="/var/run/docker.sock"
 if [[ "$MOUNT_DOCKER_SOCK" == true ]]; then
-    if [[ -S "$DOCKER_SOCK" ]]; then
-        DOCKER_ARGS+=(-v "${DOCKER_SOCK}:/var/run/docker.sock")
+    # Resolve a symlinked socket (macOS points /var/run/docker.sock at
+    # ~/.docker/run/docker.sock) so the real socket is what gets mounted — Apple
+    # container proxies the mounted unix socket into the guest just as Docker does.
+    HOST_SOCK="$DOCKER_SOCK"
+    [[ -L "$DOCKER_SOCK" ]] && HOST_SOCK="$(readlink "$DOCKER_SOCK")"
+    if [[ -S "$HOST_SOCK" ]]; then
+        RUN_ARGS+=(-v "${HOST_SOCK}:/var/run/docker.sock")
     else
-        echo "Warning: --host-docker passed but $DOCKER_SOCK not found." >&2
+        echo "Warning: --host-docker passed but no Docker socket found at $DOCKER_SOCK." >&2
     fi
 fi
 
 # Allocate a TTY if stdin is a terminal (interactive use)
 if [ -t 0 ]; then
-    DOCKER_ARGS+=(-it)
+    RUN_ARGS+=(-i -t)
 fi
+
+# Print the effective settings on every launch so it's clear what the sandbox is
+# configured with (runtime, network, Docker access, forwards).
+if [[ "$RUN_DIND" == true && "$RUNTIME" == container ]]; then
+    DOCKER_MODE="in-sandbox daemon (rootful, isolated micro-VM)"
+elif [[ "$RUN_DIND" == true ]]; then
+    DOCKER_MODE="in-sandbox daemon (rootless)"
+elif [[ "$MOUNT_DOCKER_SOCK" == true ]]; then
+    DOCKER_MODE="host socket (effective host root)"
+else
+    DOCKER_MODE="off"
+fi
+
+PORTS_DISP="none"
+if [[ ${#PORT_ARGS[@]} -gt 0 ]]; then
+    PORTS_DISP=""
+    for a in "${PORT_ARGS[@]}"; do
+        [[ "$a" == "-p" ]] && continue
+        PORTS_DISP+="${PORTS_DISP:+, }$a"
+    done
+fi
+
+MOUNTS_DISP="none"
+if [[ ${#EXTRA_MOUNT_PATHS[@]} -gt 0 ]]; then
+    MOUNTS_DISP="$(printf '%s, ' "${EXTRA_MOUNT_PATHS[@]}")"
+    MOUNTS_DISP="${MOUNTS_DISP%, }"
+fi
+
+echo "claudebox settings:" >&2
+echo "  runtime      : $RUNTIME" >&2
+echo "  image        : $IMAGE_NAME" >&2
+echo "  workdir      : $CONTAINER_WORKDIR" >&2
+echo "  LAN egress   : $([[ "$BLOCK_LAN" == true ]] && echo blocked || echo allowed)" >&2
+echo "  docker       : $DOCKER_MODE" >&2
+echo "  ssh agent    : $([[ "$FORWARD_SSH" == true ]] && echo forwarded || echo off)" >&2
+echo "  ports        : $PORTS_DISP" >&2
+echo "  extra mounts : $MOUNTS_DISP" >&2
 
 # Warn whenever a flag weakens the sandbox boundary
 if [[ "$BLOCK_LAN" != true ]]; then
@@ -223,8 +360,5 @@ if [[ "$MOUNT_DOCKER_SOCK" == true ]]; then
     echo "⚠️  --host-docker: the host Docker socket is mounted. This grants effective host root and lets the" >&2
     echo "    container escape the sandbox and bypass the LAN firewall. Only use with trusted sessions." >&2
 fi
-if [[ "$RUN_DIND" == true ]]; then
-    echo "🐳 --docker: starting an isolated rootless Docker daemon inside the container (host Docker untouched)." >&2
-fi
 
-exec docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}
+exec "$RUNTIME" run "${RUN_ARGS[@]}" "$IMAGE_NAME" ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"}

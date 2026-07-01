@@ -15,6 +15,12 @@
 #                             on the host.
 set -euo pipefail
 
+# Tell Claude it's running in a sandbox. Claude refuses
+# --dangerously-skip-permissions as root unless this is set; inside this
+# container Claude runs as root and the container itself is the sandbox, so the
+# flag is safe to allow here.
+export IS_SANDBOX=1
+
 FIREWALL_APPLIED=false
 
 apply_lan_firewall() {
@@ -79,12 +85,36 @@ start_rootless_dockerd() {
     echo "Warning: rootless dockerd did not become ready in time; see /var/log/dockerd-rootless.log" >&2
 }
 
+start_rootful_dockerd() {
+    # Under Apple `container` the box is its own micro-VM, so a normal rootful
+    # daemon is both the simplest option and safe — full privileges stay inside
+    # the disposable VM. dockerd defaults to the /var/run/docker.sock the (root)
+    # docker CLI already talks to, so no DOCKER_HOST is needed.
+    dockerd >/var/log/dockerd.log 2>&1 &
+
+    # Wait up to ~30s for the daemon to accept connections.
+    for _ in $(seq 1 60); do
+        if docker info >/dev/null 2>&1; then
+            return
+        fi
+        sleep 0.5
+    done
+    echo "Warning: rootful dockerd did not become ready in time; see /var/log/dockerd.log" >&2
+}
+
 if [[ "${CLAUDEBOX_BLOCK_LAN:-false}" == "true" ]]; then
     apply_lan_firewall
 fi
 
 if [[ "${CLAUDEBOX_DIND:-false}" == "true" ]]; then
-    start_rootless_dockerd
+    # Apple container gives the box its own kernel, so it runs a rootful daemon
+    # (CLAUDEBOX_DIND_ROOTFUL); Docker uses the rootless daemon to avoid needing
+    # host privileges.
+    if [[ "${CLAUDEBOX_DIND_ROOTFUL:-false}" == "true" ]]; then
+        start_rootful_dockerd
+    else
+        start_rootless_dockerd
+    fi
 fi
 
 # Materialise the macOS Keychain credential (forwarded as an env var) into the

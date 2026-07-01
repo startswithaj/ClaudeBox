@@ -200,10 +200,18 @@ Optional (included by default, configurable with `--with`):
 
 ## Testing
 
-`test/run.sh` builds a lean image and verifies the sandbox end to end — the firewall rules, the `CAP_NET_ADMIN` drop, internet egress, LAN blocking, and rootless Docker (`--docker`). Run it after changing the Dockerfile, the entrypoint, or the `claudebox` wrapper:
+There are three suites. Run them after changing the Dockerfile, the entrypoint, or the `claudebox` wrapper:
 
 ```bash
-test/run.sh
+test/unit.sh           # launcher logic — no runtime needed
+test/run.sh            # Docker integration
+test/run-container.sh  # Apple container integration (macOS only)
 ```
 
-It exits non-zero if any check fails. On hosts that block the user-namespace mapping rootless Docker needs (e.g. some nested CI containers), the rootless test automatically falls back to `--privileged` and says so — normal `claudebox --docker` runs unprivileged.
+- **`test/unit.sh`** exercises the launcher's decision logic with fake `container`/`docker` executables on `PATH`, so it needs no real runtime and runs anywhere: runtime selection (`--runtime`, `CLAUDEBOX_RUNTIME`, auto-detect), the `--docker` rootful-vs-rootless split, LAN wiring, the settings banner, `--host-docker`, and the Apple Silicon hint.
+- **`test/run.sh`** builds a lean image with Docker and verifies the sandbox end to end — the firewall rules, the `CAP_NET_ADMIN` drop, internet egress, LAN blocking, and rootless Docker (`--docker`). On hosts that block the user-namespace mapping rootless Docker needs (e.g. some nested CI containers), the rootless test automatically falls back to `--privileged` and says so — normal `claudebox --docker` runs unprivileged.
+- **`test/run-container.sh`** is the same end-to-end check driven through Apple `container` and the rootful in-sandbox Docker path. It **skips cleanly** when `container` isn't installed.
+
+Each exits non-zero if any check fails.
+
+**CI note:** `unit.sh` and `run.sh` run on GitHub-hosted `ubuntu-latest`. `run-container.sh` must be run **locally on an Apple Silicon Mac** (macOS 26+) — GitHub-hosted macOS runners can't run it because Apple `container` needs nested virtualization, which those runners don't provide. Run it on your dev Mac before releasing changes that touch the container-runtime paths.
