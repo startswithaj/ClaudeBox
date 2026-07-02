@@ -79,7 +79,9 @@ tart set "$CLONE" --cpu "$CPUS" --memory "$MEMORY"
 
 # Share the project and the host ~/.claude into the guest (read-write). tart
 # mounts shares under /Volumes/My Shared Files/<name>; we symlink to the real
-# paths below so Claude's session files line up with a native run.
+# paths below so Claude's session files line up with a native run. Note:
+# settings.json is deliberately NOT linked back to the host copy — see the
+# ~/.claude setup below for why.
 DIRS=(--dir "project:$PROJECT")
 [[ -d "$HOME/.claude" ]] && DIRS+=(--dir "claudehome:$HOME/.claude")
 
@@ -121,10 +123,38 @@ else
 fi
 
 # Point the guest's ~/.claude at the shared host config so settings/memory/
-# sessions persist and match the host (best-effort).
+# sessions persist and match the host. We symlink each entry individually rather
+# than the whole directory, so we can hold ONE file back: settings.json.
+#
+# Two files are held back from the share:
+#
+#   settings.json     — a code-execution surface. Its `hooks` and
+#                       `statusLine.command` keys are shell commands Claude runs.
+#                       Shared read-write, a sandboxed agent could edit them and
+#                       get that command run on the *host* next time you launch
+#                       Claude there — a guest->host escape. We copy it in one-way
+#                       (like ~/.claude.json) so guest edits never reach the host.
+#   .credentials.json — your host's live Claude auth token. Sharing it would let a
+#                       guest read and exfiltrate it. Unlike the Linux container,
+#                       the VM seeds auth via the guest Keychain (below), so this
+#                       file isn't needed in the guest at all — we just skip it.
+#
+# Everything else (projects, sessions, todos, memory, history) stays linked and
+# writable so it persists exactly as before.
 if [[ -d "$HOME/.claude" ]]; then
-    vm_ssh "rm -rf ~/.claude && ln -sfn '${SHARE_ROOT}/claudehome' ~/.claude" >/dev/null 2>&1 \
+    vm_ssh "rm -rf ~/.claude && mkdir -p ~/.claude && \
+        for e in '${SHARE_ROOT}/claudehome/'* '${SHARE_ROOT}/claudehome/'.*; do \
+            b=\$(basename \"\$e\"); \
+            case \"\$b\" in .|..|settings.json|.credentials.json) continue ;; esac; \
+            ln -sfn \"\$e\" ~/.claude/\"\$b\"; \
+        done" >/dev/null 2>&1 \
         || echo "Warning: couldn't link ~/.claude in the guest." >&2
+
+    # Seed settings.json as a real guest-local file (not a link to the host copy).
+    if [[ -f "$HOME/.claude/settings.json" ]]; then
+        vm_ssh "cat > ~/.claude/settings.json" < "$HOME/.claude/settings.json" >/dev/null 2>&1 \
+            || echo "Warning: couldn't seed guest settings.json." >&2
+    fi
 fi
 
 # Copy ~/.claude.json in. It's a file (not shareable via tart --dir) and holds
@@ -153,5 +183,14 @@ fi
 # Run Claude in the mounted project. -t for an interactive TTY. The Claude CLI
 # installs to ~/.local/bin, which a non-interactive SSH shell doesn't have on
 # PATH, so add it explicitly.
+#
+# Unlock the login keychain in THIS session too. The credential was added in the
+# separate seed session above, but keychain unlock state doesn't carry across SSH
+# sessions and non-interactive logins start locked — so without this Claude reads
+# a locked keychain and reports "Not logged in · Run: security unlock-keychain".
+# set-keychain-settings disables the auto-lock timeout so it won't re-lock during
+# a long session.
 ssh -t "${SSH_OPTS[@]}" "${SSH_USER}@${IP}" \
-    "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd '$REMOTE_DIR' && claude ${CLAUDE_ARGS[*]:-}"
+    "security unlock-keychain -p '${CLAUDEBOX_VM_PASS:-admin}' login.keychain >/dev/null 2>&1; \
+     security set-keychain-settings login.keychain >/dev/null 2>&1; \
+     export PATH=\"\$HOME/.local/bin:\$PATH\"; cd '$REMOTE_DIR' && claude ${CLAUDE_ARGS[*]:-}"

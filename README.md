@@ -207,6 +207,13 @@ prepared macOS base image, boots it, and runs Claude over SSH with your project
 and credentials forwarded in. See **[claudebox-vm.md](claudebox-vm.md)** for
 dependencies and setup. (Prototype — Apple Silicon only.)
 
+Your `~/.claude` is shared into the guest so config and sessions persist, with one
+exception: `settings.json` is copied in one-way instead of shared read-write. Its
+`hooks` and `statusLine.command` entries are shell commands Claude executes, so a
+writable share would let a sandboxed agent edit them and have that command run on
+your host the next time you start Claude there. Copying it in keeps the guest's
+config working while making sure guest edits can't escape back to the host.
+
 [tart]: https://tart.run
 
 ## Testing

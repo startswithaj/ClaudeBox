@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# claudebox-vm-base — build the golden macOS base VM that claudebox-vm clones.
+#
+# One-time (or occasional) setup: pulls a minimal macOS image, boots it, trusts
+# your SSH key, installs the Claude CLI, then shuts it down. After this,
+# `claudebox-vm` clones this base per run. Re-run with --force to rebuild (e.g.
+# to refresh macOS or re-provision).
+#
+# Requires: tart, sshpass, an SSH public key, and ~60GB free disk.
+#
+# Usage: claudebox-vm-base [--force] [--image <ref>] [--name <name>] [--key <path>]
+set -euo pipefail
+
+IMAGE="${CLAUDEBOX_VM_IMAGE:-ghcr.io/cirruslabs/macos-sequoia-vanilla:latest}"
+NAME="${CLAUDEBOX_VM_BASE:-claudebox-base}"
+PUBKEY="${CLAUDEBOX_VM_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+PASS="${CLAUDEBOX_VM_PASS:-admin}"          # default cirruslabs admin password
+USER_NAME="${CLAUDEBOX_VM_USER:-admin}"
+FORCE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force) FORCE=true; shift ;;
+        --image) IMAGE="$2"; shift 2 ;;
+        --name)  NAME="$2"; shift 2 ;;
+        --key)   PUBKEY="$2"; shift 2 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+command -v tart    >/dev/null 2>&1 || { echo "Error: tart not installed (brew install cirruslabs/cli/tart)." >&2; exit 1; }
+command -v sshpass >/dev/null 2>&1 || { echo "Error: sshpass not installed (brew install sshpass)." >&2; exit 1; }
+[[ -f "$PUBKEY" ]] || { echo "Error: SSH public key not found: $PUBKEY" >&2; exit 1; }
+
+if tart list 2>/dev/null | awk '{print $2}' | grep -qx "$NAME"; then
+    if [[ "$FORCE" == true ]]; then
+        echo "==> Removing existing base '$NAME' (--force)"
+        tart stop "$NAME" >/dev/null 2>&1 || true
+        tart delete "$NAME"
+    else
+        echo "Base '$NAME' already exists. Re-run with --force to rebuild." >&2
+        exit 1
+    fi
+fi
+
+# Always try to stop the base on exit so a failed build doesn't leave it running.
+cleanup() { tart stop "$NAME" >/dev/null 2>&1 || true; }
+trap cleanup EXIT INT TERM
+
+echo "==> Pulling + cloning base image (this is the big download, ~25-30GB)"
+echo "    image: $IMAGE"
+tart clone "$IMAGE" "$NAME"
+
+echo "==> Booting the base headless"
+tart run "$NAME" --no-graphics >/dev/null 2>&1 &
+
+echo "==> Waiting for the VM to get an IP"
+IP=""
+for _ in $(seq 1 90); do
+    IP="$(tart ip "$NAME" 2>/dev/null || true)"
+    [[ -n "$IP" ]] && break
+    sleep 1
+done
+[[ -n "$IP" ]] || { echo "Error: VM never reported an IP." >&2; exit 1; }
+echo "    IP: $IP"
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR)
+
+echo "==> Waiting for SSH (default ${USER_NAME}/${PASS})"
+for _ in $(seq 1 60); do
+    sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" "${USER_NAME}@${IP}" true 2>/dev/null && break
+    sleep 2
+done
+sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" "${USER_NAME}@${IP}" true 2>/dev/null \
+    || { echo "Error: SSH never came up." >&2; exit 1; }
+
+echo "==> Installing your SSH public key"
+sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" "${USER_NAME}@${IP}" \
+    "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo OK" \
+    < "$PUBKEY" >/dev/null
+
+echo "==> Installing the Claude CLI in the guest"
+# Key auth now works, so no more password.
+ssh "${SSH_OPTS[@]}" "${USER_NAME}@${IP}" \
+    'curl -fsSL https://claude.ai/install.sh | bash >/tmp/claude-install.log 2>&1; ~/.local/bin/claude --version'
+
+echo "==> Shutting the base down cleanly"
+tart stop "$NAME"
+trap - EXIT
+
+echo
+echo "Done. Base '$NAME' is ready. Run 'claudebox-vm' from a project to use it."
